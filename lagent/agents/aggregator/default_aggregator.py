@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 from lagent.memory import Memory
 from lagent.prompts import StrParser
@@ -7,7 +7,13 @@ from lagent.schema import ActionReturn
 
 class DefaultAggregator:
 
-    def aggregate(self, messages: Memory, name: str, parser: StrParser = None, system_instruction=None) -> List[dict]:
+    def aggregate(self,
+                  messages: Memory,
+                  name: str,
+                  parser: StrParser = None,
+                  system_instruction: str = None,
+                  tools: List[Dict] = None,
+                  ) -> Tuple[List[Dict[str, str]], Optional[List[Dict]]]:
         _message = []
         messages = messages.get_memory()
         if system_instruction:
@@ -37,7 +43,17 @@ class DefaultAggregator:
                         _message[-1]['extra_info'] = extra_info
                     else:
                         _message.append(dict(role='user', content=user_message, extra_info=extra_info))
-        return _message
+                        
+        latest_env_info = None
+        for message in messages:
+            if getattr(message, 'env_info', None) is not None:
+                latest_env_info = message.env_info
+
+        tools_to_use = tools
+        if latest_env_info and latest_env_info.get("tools"):
+            tools_to_use = latest_env_info.get("tools")
+            
+        return _message, tools_to_use
 
     @staticmethod
     def aggregate_system_intruction(system_intruction) -> List[dict]:

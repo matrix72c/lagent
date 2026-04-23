@@ -19,9 +19,9 @@ from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 
-from ..schema import ModelStatusCode
-from ..utils import filter_suffix
-from .base_api import AsyncBaseAPILLM, BaseAPILLM
+from lagent.schema import ModelStatusCode
+from lagent.utils import filter_suffix
+from lagent.llms.base_api import AsyncBaseAPILLM, BaseAPILLM
 
 warnings.simplefilter('default')
 

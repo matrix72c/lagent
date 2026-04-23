@@ -231,7 +231,6 @@ class AsyncMCPClient(AsyncActionMixin, BaseAction):
     This prevents connection leaks and 'ConnectTimeout' in high-concurrency RL environments.
     """
 
-    is_stateful = False
 
     def __init__(
         self,

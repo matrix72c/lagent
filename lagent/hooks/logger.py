@@ -13,20 +13,28 @@ class MessageLogger(Hook):
         )
         self.sender2color = {}
 
-    def before_agent(self, agent, messages, session_id):
+    def before_agent(self, agent, messages):
         for message in messages:
-            self._process_message(message, session_id)
+            self._process_message(message)
 
-    def after_agent(self, agent, message, session_id):
-        self._process_message(message, session_id)
+    def after_agent(self, agent, message):
+        self._process_message(message)
 
-    def before_action(self, executor, message, session_id):
-        self._process_message(message, session_id)
+    def before_action(self, executor, message):
+        self._process_message(message)
 
-    def after_action(self, executor, message, session_id):
-        self._process_message(message, session_id)
+    def after_action(self, executor, message):
+        self._process_message(message)
 
-    def _process_message(self, message, session_id):
+    def _process_message(self, message):
         sender = message.sender
         color = self.sender2color.setdefault(sender, random.choice(list(COLORS)))
-        self.logger.info(colored(f'session id: {session_id}, message sender: {sender}\n' f'{message.content}', color))
+        msg_str = f'message sender: {sender}'
+        if getattr(message, 'reasoning_content', None):
+            msg_str += f'\nReasoning:{message.reasoning_content}'
+        if getattr(message, 'content', None):
+            msg_str += f'\nContent:{message.content}'
+        if getattr(message, 'tool_calls', None):
+            msg_str += f'\nTool Calls:{message.tool_calls}'
+            
+        self.logger.info(colored(msg_str, color))
