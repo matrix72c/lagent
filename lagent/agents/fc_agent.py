@@ -183,20 +183,16 @@ class EnvAgent(AsyncAgent):
         tool_responses = await asyncio.gather(
             *[self._retry_mechanism(self.execute_tool)(tool_call) for tool_call in message.tool_calls]
         )
-        content = []
-        for tool_call_id, tool_response in zip(
-            message.tool_calls_ids or [tc.get('id') for tc in message.tool_calls], tool_responses
-        ):
-            tool_response.tool_call_id = tool_call_id
-            content.append(asdict(tool_response))
+        content = [asdict(resp) for resp in tool_responses]
         return AgentMessage(sender=self.name, content=content, env_info=await self.get_env_info())
 
     async def execute_tool(self, tool_call: dict) -> ActionReturn:
-        tool_call = deepcopy(tool_call)
+        tool_call, tool_call_id = deepcopy(tool_call), None
         try:
+            tool_call_id = tool_call.get('id')
             if 'function' in tool_call:
                 tool_call = tool_call['function']
-            if tool_call['name'].split('.', 1)[0] not in self.actions:
+            if tool_call['name'] not in self.actions:
                 return ActionReturn(valid=ActionValidCode.INVALID, errmsg=f'Tool {tool_call["name"]} Not Found')
             if isinstance(tool_call['arguments'], str):
                 tool_call['arguments'] = json.loads(tool_call['arguments'])
@@ -206,6 +202,7 @@ class EnvAgent(AsyncAgent):
         tool_response: ActionReturn = await action(
             tool_call['arguments'], tool_call['name'].rsplit('.', 1)[-1] if action.is_toolkit else 'run'
         )
+        tool_response.tool_call_id = tool_call_id
         if tool_response.max_tool_response_length is None:
             tool_response.max_tool_response_length = self.max_tool_response_length
         if tool_response.tool_response_truncate_side is None:
