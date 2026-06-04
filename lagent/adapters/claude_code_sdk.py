@@ -19,11 +19,9 @@ Usage::
     trace = agent.state_dict()['sdk_trace']
 """
 
-import asyncio
-import os
 from dataclasses import asdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from .base import AsyncExternalAgent
 
@@ -40,8 +38,10 @@ class ClaudeCodeSDKAdapter(AsyncExternalAgent):
         permission_mode: Permission mode. Default: "default".
         model: Model name override.
         system_prompt: Custom system prompt.
+        tools: List of built-in tools to enable (None = SDK default, [] = disable all).
         allowed_tools: List of allowed tool names.
         disallowed_tools: List of disallowed tool names.
+        mcp_servers: Dict of MCP server configs.
         cwd: Working directory for Claude Code.
         effort: Reasoning effort level ("low", "medium", "high", "max").
         thinking: Thinking config dict. Default: adaptive.
@@ -54,11 +54,16 @@ class ClaudeCodeSDKAdapter(AsyncExternalAgent):
         permission_mode: str = 'default',
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[str]] = None,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
+        mcp_servers: Optional[Dict[str, dict]] = None,
         cwd: Optional[str] = None,
+        setting_sources: Optional[List[Literal["user", "project", "local"]]] = None,
+        skills: Optional[List[str]] = None,
         effort: Optional[str] = None,
         thinking: Optional[dict] = None,
+        extra_options: Optional[dict] = None,
         **kwargs,
     ):
         kwargs.setdefault('name', 'claude-code-sdk')
@@ -69,12 +74,16 @@ class ClaudeCodeSDKAdapter(AsyncExternalAgent):
         self.permission_mode = permission_mode
         self.model = model
         self.system_prompt = system_prompt
+        self.tools = tools
         self.allowed_tools = allowed_tools or []
         self.disallowed_tools = disallowed_tools or []
+        self.mcp_servers = mcp_servers or {}
         self.cwd = cwd or self.working_dir
+        self.setting_sources = setting_sources
+        self.skills = skills
         self.effort = effort
         self.thinking = thinking
-
+        self.extra_options = extra_options or {}
         self._session_id: Optional[str] = None
         self._sdk_trace: List[dict] = []
         self._call_count = 0
@@ -83,37 +92,37 @@ class ClaudeCodeSDKAdapter(AsyncExternalAgent):
         try:
             import claude_agent_sdk
         except ImportError:
-            raise RuntimeError(
-                "claude-agent-sdk is required. "
-                "Install with: pip install claude-agent-sdk"
-            )
+            raise RuntimeError("claude-agent-sdk is required. Install with: pip install claude-agent-sdk")
 
     async def run_external_async(self, task: str, **kwargs) -> str:
         from claude_agent_sdk import (
             AssistantMessage,
             ClaudeAgentOptions,
             ResultMessage,
-            StreamEvent,
             SystemMessage,
             UserMessage,
             query,
         )
 
-        options = ClaudeAgentOptions(
-            permission_mode=self.permission_mode,
-            max_turns=self.max_turns,
-        )
-
+        options = ClaudeAgentOptions(permission_mode=self.permission_mode, max_turns=self.max_turns)
         if self.model:
             options.model = self.model
         if self.system_prompt:
             options.system_prompt = self.system_prompt
+        if self.tools is not None:
+            options.tools = self.tools
         if self.allowed_tools:
             options.allowed_tools = self.allowed_tools
         if self.disallowed_tools:
             options.disallowed_tools = self.disallowed_tools
+        if self.mcp_servers:
+            options.mcp_servers = self.mcp_servers
         if self.cwd:
             options.cwd = self.cwd
+        if self.setting_sources is not None:
+            options.setting_sources = self.setting_sources
+        if self.skills is not None:
+            options.skills = self.skills
         if self.effort:
             options.effort = self.effort
         if self.thinking:
@@ -123,13 +132,16 @@ class ClaudeCodeSDKAdapter(AsyncExternalAgent):
         if self._session_id:
             options.resume = self._session_id
 
+        if self.extra_options:
+            for key, value in self.extra_options.items():
+                setattr(options, key, value)
+
         # Inject proxy env if present
         if self.proxy:
             session_key = f"sk-proxy-{self.session_id}"
-            options.env = {
-                'ANTHROPIC_BASE_URL': self.proxy.url,
-                'ANTHROPIC_API_KEY': session_key,
-            }
+            env = options.env or {}
+            env.update({'ANTHROPIC_BASE_URL': self.proxy.url, 'ANTHROPIC_API_KEY': session_key})
+            options.env = env
 
         # Collect messages
         messages = []
@@ -190,9 +202,8 @@ class ClaudeCodeSDKAdapter(AsyncExternalAgent):
             # SDK may error after yielding some messages.
             # Log but don't lose what we already captured.
             import logging
-            logging.getLogger(__name__).warning(
-                f"SDK query error (captured {len(messages)} events): {exc}"
-            )
+
+            logging.getLogger(__name__).warning(f"SDK query error (captured {len(messages)} events): {exc}")
 
         self._sdk_trace.extend(messages)
 
@@ -214,26 +225,3 @@ class ClaudeCodeSDKAdapter(AsyncExternalAgent):
         if result_msg and result_msg.result:
             return result_msg.result
         return result_text or '(no output)'
-
-    def state_dict(self, prefix='', destination=None) -> dict:
-        dest = super().state_dict(prefix=prefix, destination=destination)
-        dest[prefix + 'sdk_trace'] = list(self._sdk_trace)
-        if self._session_id:
-            dest[prefix + 'claude_session_id'] = self._session_id
-        return dest
-
-    def load_state_dict(self, state_dict: dict):
-        filtered = {
-            k: v for k, v in state_dict.items()
-            if not k.endswith(('sdk_trace', 'claude_session_id'))
-        }
-        if not any(k.endswith('memory') for k in filtered):
-            filtered['memory'] = []
-        super().load_state_dict(filtered)
-
-        # Restore session for multi-turn
-        for k, v in state_dict.items():
-            if k.endswith('claude_session_id'):
-                self._session_id = v
-            if k.endswith('sdk_trace'):
-                self._sdk_trace = v or []
