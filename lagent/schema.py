@@ -18,13 +18,41 @@ def dataclass2dict(data):
     return asdict(data, dict_factory=enum_dict_factory)
 
 
+class _StatusCodeMixin:
+    """Mixin for IntEnum status codes. Adds ``from_any`` to recover the enum
+    member after JSON/Ray serialization round-trips (where IntEnum may degrade
+    to int, member-name string, or stringified int). Returns ``None`` when no
+    member matches, so callers can keep the comparison silent.
+    """
+
+    @classmethod
+    def from_any(cls, value):
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            try:
+                return cls(value)
+            except ValueError:
+                return None
+        if isinstance(value, str):
+            if value in cls.__members__:
+                return cls[value]
+            try:
+                return cls(int(value))
+            except (ValueError, TypeError):
+                return None
+        return None
+
+
 @dataclass
 class FunctionCall:
     name: str
     parameters: Union[Dict, str]
 
 
-class ActionStatusCode(IntEnum):
+class ActionStatusCode(_StatusCodeMixin, IntEnum):
     ING = 1
     SUCCESS = 0
     HTTP_ERROR = -1000  # http error
@@ -32,7 +60,7 @@ class ActionStatusCode(IntEnum):
     API_ERROR = -1002  # unknown error
 
 
-class ActionValidCode(IntEnum):
+class ActionValidCode(_StatusCodeMixin, IntEnum):
     FINISH = 1
     OPEN = 0
     CLOSED = -1
@@ -73,7 +101,7 @@ class ActionReturn:
 
 
 # need to integrate int, so asdict can convert AgentStatusCode to int
-class ModelStatusCode(IntEnum):
+class ModelStatusCode(_StatusCodeMixin, IntEnum):
     END = 0  # end of streaming
     STREAM_ING = 1  # response is in streaming
     SERVER_ERR = -1  # triton server's error
@@ -83,7 +111,7 @@ class ModelStatusCode(IntEnum):
     SESSION_READY = 2  # session is ready for inference
 
 
-class AgentStatusCode(IntEnum):
+class AgentStatusCode(_StatusCodeMixin, IntEnum):
     END = 0  # end of streaming
     STREAM_ING = 1  # response is in streaming
     SERVER_ERR = -1  # triton server's error
@@ -109,6 +137,7 @@ class AgentMessage(BaseModel):
     extra_info: dict = Field(default_factory=dict)
     stream_state: Union[ModelStatusCode, AgentStatusCode] = AgentStatusCode.END
     finish_reason: Optional[str] = None
+    finish_info: Optional[dict] = None
     uid: Union[int, str] = Field(default_factory=lambda: uuid4().hex, repr=False)
     env_info: Optional[Dict[str, Any]] = None
 
@@ -121,7 +150,7 @@ class AgentMessage(BaseModel):
             self.role = self.sender
 
     @classmethod
-    def from_model_response(cls, response: Union[ChatCompletion, dict], sender: str) -> "AgentMessage":
+    def from_model_response(cls, response: Union[ChatCompletion, dict], sender: str) -> 'AgentMessage':
         """Convert model response (ChatCompletion object or model_dump dict) to AgentMessage."""
         if not isinstance(response, dict):
             response = response.model_dump()
@@ -129,12 +158,23 @@ class AgentMessage(BaseModel):
         choice = response['choices'][0]
         msg = choice.get('message', {})
         finish_reason = choice.get('finish_reason')
+        extra_info = dict(msg.get('extra_info') or {})
+
+        meta_info = dict(extra_info.get('meta_info') or {})
+        for key in ('id', 'model', 'created', 'usage'):
+            if response.get(key) is not None:
+                meta_info[key] = response[key]
+        if choice.get('index') is not None:
+            meta_info['choice_index'] = choice['index']
+        if meta_info:
+            extra_info['meta_info'] = meta_info
+
         return cls(
             sender=sender,
-            content=msg.get('content') or "",
+            content=msg.get('content') or '',
             reasoning_content=msg.get('reasoning_content'),
             tool_calls=msg.get('tool_calls'),
-            extra_info=msg.get('extra_info') or {},
+            extra_info=extra_info,
             stream_state=choice.get('stream_state', AgentStatusCode.END),
             finish_reason=finish_reason,
         )
@@ -161,8 +201,12 @@ class AgentMessage(BaseModel):
             return res
 
         msg = {'role': final_role, 'content': self.content}
-        if final_role != 'assistant':
-            msg['extra_info'] = self.extra_info
+        extra_info = self.extra_info
+        if self.finish_reason is not None:
+            extra_info = dict(extra_info)
+            extra_info.setdefault('finish_reason', self.finish_reason)
+        if final_role != 'assistant' or extra_info:
+            msg['extra_info'] = extra_info
         if self.reasoning_content is not None:
             msg['reasoning_content'] = self.reasoning_content
         if self.tool_calls is not None:

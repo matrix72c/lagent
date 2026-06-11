@@ -10,12 +10,12 @@ from typing import Any, Dict, List, Literal, Optional, Protocol, Union
 
 from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
-from lagent.schema import ActionReturn, ActionStatusCode, ActionValidCode, AgentMessage, AgentStatusCode
+from lagent.schema import ActionReturn, ActionStatusCode, ActionValidCode, AgentMessage
 from lagent.skills.skills import SkillsLoader
 from lagent.utils import create_object, load_class_from_string, truncate_text
-from .agent import AsyncAgent
+from .agent import AsyncAgent, _maybe_close
 
-logger = logging.getLogger("lagent.agents.fc_agent")
+logger = logging.getLogger('lagent.agents.fc_agent')
 
 
 class FunctionCallAgent(AsyncAgent):
@@ -25,9 +25,8 @@ class FunctionCallAgent(AsyncAgent):
         env_agent: Union[Dict, AsyncAgent],
         compact_agent: Optional[Dict] = None,
         consolidate_agent: Optional[Dict] = None,
-        finish_condition: callable = lambda m, _: m and not m.tool_calls,
+        finish_condition: callable = lambda m, _: {'reason': 'final_answer'} if m and not m.tool_calls else None,
         max_turn: Optional[int] = None,
-        initialize_input: bool = True,
         name: Optional[str] = None,
         **kwargs,
     ):
@@ -38,39 +37,66 @@ class FunctionCallAgent(AsyncAgent):
         self.consolidate_agent = create_object(consolidate_agent)
         if isinstance(finish_condition, str):
             finish_condition = load_class_from_string(finish_condition)
+        elif isinstance(finish_condition, dict):
+            finish_condition = create_object(finish_condition)
         self.finish_condition = finish_condition
         self.max_turn = max_turn
-        self.initialize_input = initialize_input
 
     async def forward(self, env_message: AgentMessage, **kwargs):
-        policy_message: AgentMessage = None
+        policy_message: Optional[AgentMessage] = None
+        finish_info: Optional[dict] = None
         current_turn = 0
-        if self.initialize_input:
-            env_message = await self.env_agent(env_message, **kwargs)
+        env_message = await self.env_agent(env_message, **kwargs)
 
-        while (self.finish_condition is None or not self.finish_condition(policy_message, env_message)) and (
-            self.max_turn is None or current_turn < self.max_turn
-        ):
+        while True:
+            if self.max_turn is not None and current_turn > self.max_turn:
+                finish_info = {
+                    'reason': 'max_turn',
+                    'details': {'current_turn': current_turn, 'max_turn': self.max_turn},
+                }
+                break
+
             policy_message = await self.policy_agent(env_message, **kwargs)
             if policy_message.finish_reason == 'error':
-                for _ in range(2):  # remove the last two messages
+                details = {'finish_reason': policy_message.finish_reason}
+                error_info = policy_message.extra_info or {}
+                if error_info.get('error_type') is not None:
+                    details['error_type'] = error_info['error_type']
+                if error_info.get('error_text') is not None:
+                    details['error_text'] = truncate_text(str(error_info['error_text']), max_num=512, side='middle')
+                finish_info = {'reason': 'input_length_exceeded', 'details': details}
+                for _ in range(2):  # remove the last env input and input-length error assistant message
                     self.policy_agent.memory.delete(-1)
-                return AgentMessage(
-                    sender=self.name,
-                    content=policy_message.content,
-                    finish_reason=policy_message.finish_reason,
-                )
-            if policy_message.finish_reason == 'abort':
-                return AgentMessage(sender=self.name, content=policy_message.content, finish_reason='abort')
+                break
+
+            finish_info = self._check_finish_condition(policy_message, None)
+            if finish_info is not None:
+                break
 
             # Orchestrator manages memory
             await self._maybe_manage_memory(policy_message, env_message)
 
             env_message = await self.env_agent(policy_message)
             current_turn += 1
-        if policy_message is not None:
-            return AgentMessage(sender=self.name, content=policy_message.content, finish_reason='stop')
-        return AgentMessage(sender=self.name, content="Finished", finish_reason='stop')
+
+            finish_info = self._check_finish_condition(policy_message, env_message)
+            if finish_info is not None:
+                break
+
+        final_message = deepcopy(policy_message if policy_message is not None else env_message)
+        final_message.sender = self.name
+        if finish_info:
+            final_message.finish_info = finish_info
+        return final_message
+
+    def _check_finish_condition(
+        self,
+        policy_message: Optional[AgentMessage],
+        env_message: Optional[AgentMessage],
+    ) -> Optional[dict]:
+        if self.finish_condition is None:
+            return None
+        return self.finish_condition(policy_message, env_message)
 
     async def _maybe_manage_memory(self, policy_message: AgentMessage, env_message: AgentMessage) -> None:
         """Orchestrate compact and consolidate.
@@ -102,9 +128,9 @@ class FunctionCallAgent(AsyncAgent):
             try:
                 await self.consolidate_agent(compact_input)
                 self.consolidate_agent.reset(recursive=True)
-                logger.info("Consolidation completed")
+                logger.info('Consolidation completed')
             except Exception:
-                logger.exception("Consolidation failed, continuing with compact")
+                logger.exception('Consolidation failed, continuing with compact')
         # 2. Compact — inject summary + boundary into env_message
         try:
             summary_msg = await self.compact_agent(compact_input)
@@ -114,9 +140,9 @@ class FunctionCallAgent(AsyncAgent):
                     env_message.env_info = {}
                 env_message.env_info['conversation_summary'] = summary_msg.content
                 env_message.env_info['compact_boundary'] = len(self.policy_agent.memory.memory)
-                logger.info("Compact summary injected (%d chars)", len(summary_msg.content))
+                logger.info('Compact summary injected (%d chars)', len(summary_msg.content))
         except Exception:
-            logger.exception("Compact failed")
+            logger.exception('Compact failed')
 
     def get_messages(self, prefix='', destination=None) -> List[Dict[str, list]]:
         message_dict = super().get_messages(prefix, destination)
@@ -125,7 +151,10 @@ class FunctionCallAgent(AsyncAgent):
 
 class MemoryProvider(Protocol):
     async def get_info(self) -> dict:
-        """Return long-term memory info for EnvAgent's env_info. The content and format are flexible, but should be concise."""
+        """Return long-term memory info for EnvAgent's env_info.
+
+        The content and format are flexible, but should be concise.
+        """
         ...
 
 
@@ -181,6 +210,24 @@ class EnvAgent(AsyncAgent):
         tool_responses = await asyncio.gather(
             *[self._retry_mechanism(self.execute_tool)(tool_call) for tool_call in message.tool_calls]
         )
+        for tool_response in tool_responses:
+            if tool_response.valid != ActionValidCode.OPEN or tool_response.state != ActionStatusCode.SUCCESS:
+                continue
+            max_length = tool_response.max_tool_response_length
+            if max_length is None:
+                continue
+            result_parts = []
+            for item in tool_response.result or []:
+                if item['type'] == 'text':
+                    result_parts.append(item['content'])
+                else:
+                    result_parts.append(f"[{item['type']}]({item['content']})")
+            result = '\n'.join(result_parts)
+            if len(result) > max_length:
+                result = truncate_text(
+                    result, max_num=max_length, side=tool_response.tool_response_truncate_side or 'middle'
+                )
+                tool_response.result = [{'type': 'text', 'content': result}]
         content = [asdict(resp) for resp in tool_responses]
         return AgentMessage(sender=self.name, content=content, env_info=await self.get_env_info())
 
@@ -191,11 +238,15 @@ class EnvAgent(AsyncAgent):
             if 'function' in tool_call:
                 tool_call = tool_call['function']
             if tool_call['name'] not in self.actions:
-                return ActionReturn(valid=ActionValidCode.INVALID, errmsg=f'Tool {tool_call["name"]} Not Found')
+                return ActionReturn(
+                    valid=ActionValidCode.INVALID, errmsg=f'FunctionNotFindError: Tool {tool_call["name"]} Not Found'
+                )
             if isinstance(tool_call['arguments'], str):
                 tool_call['arguments'] = json.loads(tool_call['arguments'])
         except Exception as e:
-            return ActionReturn(valid=ActionValidCode.INVALID, errmsg=f'Invalid tool call format: {str(e)}')
+            return ActionReturn(
+                valid=ActionValidCode.INVALID, errmsg=f'JsonLoadError: Invalid tool call format: {str(e)}'
+            )
         action = self.actions[tool_call['name']]
         tool_response: ActionReturn = await action(
             tool_call['arguments'], tool_call['name'].rsplit('.', 1)[-1] if action.is_toolkit else 'run'
@@ -206,3 +257,15 @@ class EnvAgent(AsyncAgent):
         if tool_response.tool_response_truncate_side is None:
             tool_response.tool_response_truncate_side = self.tool_response_truncate_side
         return tool_response
+
+    async def close(self, recursive: bool = True) -> None:
+        seen = set()
+        for action in self.actions.values():
+            action_id = id(action)
+            if action_id in seen:
+                continue
+            seen.add(action_id)
+            await _maybe_close(action)
+        await _maybe_close(self.skills)
+        await _maybe_close(self.long_term_memory)
+        await super().close(recursive=recursive)
