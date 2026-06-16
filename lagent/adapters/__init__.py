@@ -7,6 +7,7 @@ from .mini_swe_agent import MiniSWEAgentAdapter
 from .openhands import OpenHandsAdapter
 from .proxy import SessionClient
 from .sdk_adapter import SDKAgentAdapter
+from .terminus2 import Terminus2Adapter
 
 __all__ = [
     'BaseExternalAgent',
@@ -19,4 +20,5 @@ __all__ = [
     'SDKAgentAdapter',
     'MiniSWEAgentAdapter',
     'SessionClient',
+    'Terminus2Adapter',
 ]
