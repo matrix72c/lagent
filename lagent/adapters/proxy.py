@@ -34,7 +34,7 @@ import os
 import re
 import uuid
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 import aiohttp
@@ -292,6 +292,11 @@ class SessionClient:
         real_api_key: The actual API key to use when forwarding requests.
         real_base_url: The actual LLM API base URL to forward to.
         port: Port to listen on. 0 means auto-assign.
+        client_timeout: Optional timeout for requests from this proxy to the
+            upstream model endpoint. Pass either ``aiohttp.ClientTimeout`` or
+            a dict accepted by that class, for example
+            ``{"total": None, "sock_connect": 30, "sock_read": 3600}``.
+            ``None`` preserves aiohttp's default behavior.
     """
 
     def __init__(
@@ -302,11 +307,15 @@ class SessionClient:
         session_id: Optional[str] = None,
         extra_body: Optional[dict] = None,
         http_proxy: Optional[str] = None,
+        client_timeout: Optional[Union[aiohttp.ClientTimeout, dict]] = None,
     ):
         self.real_api_key = real_api_key
         self.real_base_url = real_base_url.rstrip('/')
         self.port = port
         self.http_proxy = http_proxy
+        if isinstance(client_timeout, dict):
+            client_timeout = aiohttp.ClientTimeout(**client_timeout)
+        self.client_timeout = client_timeout
         self.session_id = session_id or ctx_session_id.get() or os.getenv('XTUNER_SESSION_ID') or str(uuid.uuid4().int)
         self.extra_body = extra_body or {}
         self._records: Dict[str, List[Dict[str, list]]] = defaultdict(list)
@@ -436,7 +445,8 @@ class SessionClient:
 
         is_stream = provider_request_data.get('stream', False) if provider_request_data else False
 
-        async with aiohttp.ClientSession() as client:
+        client_kwargs = {} if self.client_timeout is None else {'timeout': self.client_timeout}
+        async with aiohttp.ClientSession(**client_kwargs) as client:
             async with client.request(
                 method=request.method,
                 url=target_url,

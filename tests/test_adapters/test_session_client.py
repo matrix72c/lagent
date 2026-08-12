@@ -1,5 +1,3 @@
-import asyncio
-import json
 import logging
 import os
 
@@ -7,6 +5,65 @@ import aiohttp
 import pytest
 
 from lagent.adapters.proxy import SessionClient
+
+
+def _proxy(**kwargs):
+    return SessionClient(
+        real_api_key="EMPTY",
+        real_base_url="http://example.test/v1",
+        session_id="timeout-test",
+        **kwargs,
+    )
+
+
+def test_client_timeout_accepts_aiohttp_object():
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=3600)
+    proxy = _proxy(client_timeout=timeout)
+
+    assert proxy.client_timeout is timeout
+
+
+def test_client_timeout_builds_from_serializable_dict():
+    proxy = _proxy(
+        client_timeout={
+            "total": None,
+            "sock_connect": 30,
+            "sock_read": 3600,
+        }
+    )
+
+    assert isinstance(proxy.client_timeout, aiohttp.ClientTimeout)
+    assert proxy.client_timeout.total is None
+    assert proxy.client_timeout.sock_connect == 30
+    assert proxy.client_timeout.sock_read == 3600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('client_timeout', [None, {'sock_read': 3600}])
+async def test_client_timeout_is_passed_to_client_session(monkeypatch, client_timeout):
+    proxy = _proxy(client_timeout=client_timeout)
+    client_kwargs = None
+
+    def create_client(**kwargs):
+        nonlocal client_kwargs
+        client_kwargs = kwargs
+        raise RuntimeError('stop before sending the request')
+
+    class Request:
+        headers = {}
+        match_info = {'path': 'v1/chat/completions'}
+        method = 'POST'
+        query_string = ''
+
+        async def read(self):
+            return b'{}'
+
+    monkeypatch.setattr(aiohttp, 'ClientSession', create_client)
+    with pytest.raises(RuntimeError, match='stop before sending the request'):
+        await proxy._handle_request(Request())
+
+    expected = {} if client_timeout is None else {'timeout': proxy.client_timeout}
+    assert client_kwargs == expected
 
 
 def test_get_messages_normalizes_openclaw_tool_call_id_underscore_loss():
