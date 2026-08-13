@@ -5,7 +5,9 @@ This proxy intercepts API calls from external agents, forwards them
 to the actual model backend, and quietly records the full conversation history (trajectories).
 
 Key Features:
-- **Direct Passthrough**: Calls OpenAI models using OpenAI format, and Anthropic models using Anthropic format. Returns matching formats identically without forced translation.
+- **Direct Passthrough**: Calls OpenAI models using OpenAI format, and
+  Anthropic models using Anthropic format. Returns matching formats
+  identically without forced translation.
 - **Trajectory Recording**: Merges and retains conversation turns into `_records`.
   Interrupted or duplicate prefix traces are intelligently filtered when calling
   `get_messages()`.
@@ -92,6 +94,30 @@ _NON_TOKENIZED_KEYS = ('cache_control',)
 _TOKENIZED_MSG_KEYS = ('tool_call_id', 'name', 'reasoning_content', 'function_call', 'refusal')
 _OPENAI_REASONING_DELTA_KEYS = ('reasoning_content', 'reasoning', 'thinking')
 _OPENCLAW_TOOL_CALL_ID_RE = re.compile(r'^call_?([0-9a-fA-F]{8,})$')
+
+
+def _merge_anthropic_system_messages(request_data: dict[str, Any]) -> None:
+    messages = request_data.get('messages')
+    if not isinstance(messages, list):
+        return
+    system_contents = [message['content'] for message in messages if message['role'] == 'system']
+    if not system_contents:
+        return
+
+    if request_data.get('system') is not None:
+        system_contents.insert(0, request_data['system'])
+
+    system_blocks: list[dict[str, Any]] = []
+    for content in system_contents:
+        if system_blocks:
+            system_blocks.append({'type': 'text', 'text': '\n\n'})
+        if isinstance(content, str):
+            system_blocks.append({'type': 'text', 'text': content})
+        else:
+            system_blocks.extend(content)
+
+    request_data['system'] = system_blocks
+    request_data['messages'] = [message for message in messages if message['role'] != 'system']
 
 
 def _extract_openai_reasoning_delta(delta: dict[str, Any]) -> Optional[str]:
@@ -297,6 +323,9 @@ class SessionClient:
             a dict accepted by that class, for example
             ``{"total": None, "sock_connect": 30, "sock_read": 3600}``.
             ``None`` preserves aiohttp's default behavior.
+        merge_anthropic_system_messages: Move ``system`` role messages from an
+            Anthropic request's ``messages`` list into its top-level ``system``
+            field before forwarding and recording the request.
     """
 
     def __init__(
@@ -308,6 +337,7 @@ class SessionClient:
         extra_body: Optional[dict] = None,
         http_proxy: Optional[str] = None,
         client_timeout: Optional[Union[aiohttp.ClientTimeout, dict]] = None,
+        merge_anthropic_system_messages: bool = False,
     ):
         self.real_api_key = real_api_key
         self.real_base_url = real_base_url.rstrip('/')
@@ -316,6 +346,7 @@ class SessionClient:
         if isinstance(client_timeout, dict):
             client_timeout = aiohttp.ClientTimeout(**client_timeout)
         self.client_timeout = client_timeout
+        self.merge_anthropic_system_messages = merge_anthropic_system_messages
         self.session_id = session_id or ctx_session_id.get() or os.getenv('XTUNER_SESSION_ID') or str(uuid.uuid4().int)
         self.extra_body = extra_body or {}
         self._records: Dict[str, List[Dict[str, list]]] = defaultdict(list)
@@ -401,6 +432,8 @@ class SessionClient:
                 # "context_management: Extra inputs are not permitted").
                 for _f in _DROP_ANTHROPIC_BODY_FIELDS:
                     request_data.pop(_f, None)
+                if self.merge_anthropic_system_messages:
+                    _merge_anthropic_system_messages(request_data)
             request_body = json.dumps(request_data).encode('utf-8')
 
         # By default we assume the incoming request is already in the target format

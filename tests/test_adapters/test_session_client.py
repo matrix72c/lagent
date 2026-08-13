@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 
@@ -9,11 +10,40 @@ from lagent.adapters.proxy import SessionClient
 
 def _proxy(**kwargs):
     return SessionClient(
-        real_api_key="EMPTY",
-        real_base_url="http://example.test/v1",
-        session_id="timeout-test",
+        real_api_key='EMPTY',
+        real_base_url='http://example.test/v1',
+        session_id='timeout-test',
         **kwargs,
     )
+
+
+async def _capture_forwarded_request(monkeypatch, proxy, payload, path='v1/messages'):
+    captured = {}
+
+    class Request:
+        headers = {}
+        match_info = {'path': path}
+        method = 'POST'
+        query_string = ''
+
+        async def read(self):
+            return json.dumps(payload).encode('utf-8')
+
+    class ClientSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError('stop before sending the request')
+
+    monkeypatch.setattr(aiohttp, 'ClientSession', lambda **kwargs: ClientSession())
+    with pytest.raises(RuntimeError, match='stop before sending the request'):
+        await proxy._handle_request(Request())
+    return json.loads(captured['data'])
 
 
 def test_client_timeout_accepts_aiohttp_object():
@@ -26,9 +56,9 @@ def test_client_timeout_accepts_aiohttp_object():
 def test_client_timeout_builds_from_serializable_dict():
     proxy = _proxy(
         client_timeout={
-            "total": None,
-            "sock_connect": 30,
-            "sock_read": 3600,
+            'total': None,
+            'sock_connect': 30,
+            'sock_read': 3600,
         }
     )
 
@@ -64,6 +94,128 @@ async def test_client_timeout_is_passed_to_client_session(monkeypatch, client_ti
 
     expected = {} if client_timeout is None else {'timeout': proxy.client_timeout}
     assert client_kwargs == expected
+
+
+@pytest.mark.asyncio
+async def test_anthropic_system_messages_are_preserved_by_default(monkeypatch):
+    proxy = _proxy()
+    payload = {
+        'model': 'fake-model',
+        'max_tokens': 32,
+        'messages': [
+            {'role': 'user', 'content': 'question'},
+            {'role': 'system', 'content': 'project instruction'},
+        ],
+    }
+
+    forwarded = await _capture_forwarded_request(monkeypatch, proxy, payload)
+
+    assert forwarded['messages'] == payload['messages']
+    assert 'system' not in forwarded
+
+
+@pytest.mark.asyncio
+async def test_anthropic_request_without_system_messages_is_unchanged(monkeypatch):
+    proxy = _proxy(merge_anthropic_system_messages=True)
+    payload = {
+        'model': 'fake-model',
+        'max_tokens': 32,
+        'system': 'base instruction',
+        'messages': [{'role': 'user', 'content': 'question'}],
+    }
+
+    forwarded = await _capture_forwarded_request(monkeypatch, proxy, payload)
+
+    assert forwarded['system'] == payload['system']
+    assert forwarded['messages'] == payload['messages']
+
+
+@pytest.mark.asyncio
+async def test_anthropic_system_messages_are_merged_before_forwarding_and_recording(monkeypatch):
+    proxy = _proxy(merge_anthropic_system_messages=True)
+    payload = {
+        'model': 'fake-model',
+        'max_tokens': 32,
+        'system': [
+            {
+                'type': 'text',
+                'text': 'base instruction',
+                'cache_control': {'type': 'ephemeral'},
+            }
+        ],
+        'messages': [
+            {'role': 'user', 'content': 'question'},
+            {'role': 'system', 'content': 'project instruction'},
+            {'role': 'assistant', 'content': 'working'},
+            {
+                'role': 'system',
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': 'later instruction',
+                        'cache_control': {'type': 'ephemeral'},
+                    }
+                ],
+            },
+            {'role': 'user', 'content': 'continue'},
+        ],
+    }
+
+    forwarded = await _capture_forwarded_request(monkeypatch, proxy, payload)
+
+    assert forwarded['system'] == [
+        {
+            'type': 'text',
+            'text': 'base instruction',
+            'cache_control': {'type': 'ephemeral'},
+        },
+        {'type': 'text', 'text': '\n\n'},
+        {'type': 'text', 'text': 'project instruction'},
+        {'type': 'text', 'text': '\n\n'},
+        {
+            'type': 'text',
+            'text': 'later instruction',
+            'cache_control': {'type': 'ephemeral'},
+        },
+    ]
+    assert forwarded['messages'] == [
+        {'role': 'user', 'content': 'question'},
+        {'role': 'assistant', 'content': 'working'},
+        {'role': 'user', 'content': 'continue'},
+    ]
+
+    record = proxy._build_anthropic_record(
+        forwarded,
+        {'content': [{'type': 'text', 'text': 'answer'}]},
+    )
+    assert record is not None
+    messages, _ = record
+    assert messages[0] == {
+        'role': 'system',
+        'content': 'base instruction\n\nproject instruction\n\nlater instruction',
+    }
+    assert [message['role'] for message in messages] == ['system', 'user', 'assistant', 'user', 'assistant']
+
+
+@pytest.mark.asyncio
+async def test_anthropic_batch_request_without_top_level_messages_is_unchanged(monkeypatch):
+    proxy = _proxy(merge_anthropic_system_messages=True)
+    payload = {
+        'requests': [
+            {
+                'custom_id': 'request-1',
+                'params': {
+                    'model': 'fake-model',
+                    'max_tokens': 32,
+                    'messages': [{'role': 'user', 'content': 'question'}],
+                },
+            }
+        ]
+    }
+
+    forwarded = await _capture_forwarded_request(monkeypatch, proxy, payload, path='v1/messages/batches')
+
+    assert forwarded['requests'] == payload['requests']
 
 
 def test_get_messages_normalizes_openclaw_tool_call_id_underscore_loss():
