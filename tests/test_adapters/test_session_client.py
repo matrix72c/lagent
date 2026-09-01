@@ -1,12 +1,192 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
+from unittest.mock import Mock
 
 import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
-from lagent.adapters.proxy import SessionClient
+from lagent.adapters.proxy import SessionClient, _classify_endpoint
+
+
+@pytest.mark.parametrize(
+    ('method', 'path', 'expected'),
+    [
+        ('POST', 'v1/messages', 'anthropic_messages'),
+        ('POST', '/gateway/v1/messages?beta=true', 'anthropic_messages'),
+        ('POST', '/v1/messages/count_tokens', 'anthropic_count_tokens'),
+        ('POST', '/v1/chat/completions', 'openai_chat_completions'),
+        ('POST', '/prefix/v1/responses', 'openai_responses'),
+        ('HEAD', '/api/hello', 'hello'),
+        ('GET', '/v1/models', None),
+        ('GET', '/v1/messages', None),
+        ('POST', '/terminate', None),
+        ('POST', '/update_weights', None),
+        ('POST', '/sleep', None),
+        ('POST', '/wakeup', None),
+    ],
+)
+def test_endpoint_classification(method, path, expected):
+    assert _classify_endpoint(method, path) == expected
+
+
+@asynccontextmanager
+async def _running_session_client(response_for_path, *, extra_body=None):
+    calls = []
+
+    async def upstream_handler(request):
+        calls.append(
+            {
+                'method': request.method,
+                'path': request.path,
+                'query': request.query_string,
+                'headers': dict(request.headers),
+                'body': await request.read(),
+            }
+        )
+        status, headers, body = response_for_path(request.path)
+        return web.Response(status=status, headers=headers, body=body)
+
+    upstream_app = web.Application()
+    upstream_app.router.add_route('*', '/{path:.*}', upstream_handler)
+    upstream = TestServer(upstream_app)
+    await upstream.start_server()
+    proxy = SessionClient(
+        real_api_key='upstream-secret',
+        real_base_url=str(upstream.make_url('')).rstrip('/'),
+        session_id='trace-session',
+        extra_body=extra_body,
+        port=0,
+    )
+    await proxy.start()
+    try:
+        yield proxy, calls
+    finally:
+        await proxy.stop()
+        await upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_is_byte_transparent_and_unrecorded():
+
+    def response_for_path(_path):
+        return 200, {'Content-Type': 'application/json'}, b'{"input_tokens":17}'
+
+    raw_request = (
+        b'{"model":"test-model","messages":[{"role":"user","content":"hello"}],'
+        b'"system":"system","tools":[{"name":"tool","input_schema":{"type":"object"}}]}'
+    )
+    headers = {
+        'Authorization': 'Bearer client-secret',
+        'x-api-key': 'client-secret',
+        'anthropic-version': '2024-01-01',
+        'anthropic-beta': 'unknown-beta',
+        'Content-Type': 'application/json',
+    }
+
+    async with _running_session_client(response_for_path, extra_body={'return_token_ids': True}) as (proxy, calls):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f'{proxy.url}/v1/messages/count_tokens?beta=true', data=raw_request, headers=headers
+            ) as response:
+                assert response.status == 200
+                assert await response.read() == b'{"input_tokens":17}'
+
+        assert len(calls) == 1
+        assert calls[0]['body'] == raw_request
+        assert calls[0]['query'] == 'beta=true'
+        assert calls[0]['headers']['Authorization'] == 'Bearer upstream-secret'
+        assert calls[0]['headers']['x-api-key'] == 'upstream-secret'
+        assert calls[0]['headers']['anthropic-version'] == '2023-06-01'
+        assert calls[0]['headers']['anthropic-beta'] == 'unknown-beta'
+        assert proxy.get_messages() == []
+
+
+@pytest.mark.asyncio
+async def test_generation_endpoints_are_injected_and_recorded():
+    responses = {
+        '/v1/messages': b'{"type":"message","role":"assistant","content":[]}',
+        '/v1/chat/completions': b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}',
+        '/v1/responses': b'{"output":[{"type":"message","role":"assistant","content":[]}]}',
+    }
+
+    def response_for_path(path):
+        return 200, {'Content-Type': 'application/json'}, responses[path]
+
+    async with _running_session_client(response_for_path, extra_body={'return_token_ids': True}) as (proxy, calls):
+        proxy._build_anthropic_record = Mock(return_value=([{'role': 'assistant', 'content': 'a'}], None))
+        proxy._build_openai_record = Mock(return_value=([{'role': 'assistant', 'content': 'b'}], None))
+        proxy._build_responses_record = Mock(return_value=([{'role': 'assistant', 'content': 'c'}], None))
+        requests = [
+            ('/v1/messages', {'model': 'm', 'messages': [{'role': 'user', 'content': 'a'}]}),
+            ('/v1/chat/completions', {'model': 'm', 'messages': [{'role': 'user', 'content': 'b'}]}),
+            ('/v1/responses', {'model': 'm', 'input': 'c'}),
+        ]
+
+        async with aiohttp.ClientSession() as session:
+            for path, payload in requests:
+                async with session.post(f'{proxy.url}{path}', json=payload) as response:
+                    assert response.status == 200
+                    await response.read()
+
+        assert len(calls) == 3
+        forwarded = [json.loads(call['body']) for call in calls]
+        assert all(body['session_id'] == 'trace-session' for body in forwarded)
+        assert all(body['return_token_ids'] is True for body in forwarded)
+        assert forwarded[0]['provider'] == 'anthropic'
+        assert 'provider' not in forwarded[1]
+        assert 'provider' not in forwarded[2]
+        proxy._build_anthropic_record.assert_called_once()
+        proxy._build_openai_record.assert_called_once()
+        proxy._build_responses_record.assert_called_once()
+        assert len(proxy.get_messages()) == 3
+
+
+@pytest.mark.asyncio
+async def test_upstream_error_and_non_object_response_are_returned_unchanged():
+    error_body = b'{"type":"error","error":{"type":"invalid_request_error","message":"retry me"}}'
+
+    def response_for_path(path):
+        if path == '/v1/messages':
+            return 400, {'Content-Type': 'application/json'}, error_body
+        return 200, {'Content-Type': 'application/json'}, b'[]'
+
+    async with _running_session_client(response_for_path) as (proxy, _calls):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f'{proxy.url}/v1/messages', json={'messages': []}) as response:
+                assert response.status == 400
+                assert await response.read() == error_body
+            async with session.post(f'{proxy.url}/v1/chat/completions', json={'messages': []}) as response:
+                assert response.status == 200
+                assert await response.read() == b'[]'
+        assert proxy.get_messages() == []
+
+
+@pytest.mark.asyncio
+async def test_hello_and_rejected_endpoints_never_reach_upstream():
+
+    def response_for_path(_path):
+        raise AssertionError('rejected request reached upstream')
+
+    async with _running_session_client(response_for_path) as (proxy, calls):
+        async with aiohttp.ClientSession() as session:
+            async with session.head(f'{proxy.url}/api/hello') as response:
+                assert response.status == 204
+            for method, path in [
+                ('GET', '/v1/models'),
+                ('GET', '/v1/messages'),
+                ('POST', '/terminate'),
+                ('POST', '/update_weights'),
+                ('POST', '/sleep'),
+                ('POST', '/wakeup'),
+            ]:
+                async with session.request(method, f'{proxy.url}{path}', data=b'super-secret-body') as response:
+                    assert response.status == 404
+        assert calls == []
 
 
 def test_get_messages_normalizes_openclaw_tool_call_id_underscore_loss():

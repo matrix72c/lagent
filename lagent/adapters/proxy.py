@@ -44,6 +44,45 @@ from lagent.utils import ctx_session_id, get_logger
 
 logger = get_logger(__name__, 'info')
 
+_ENDPOINT_ANTHROPIC_MESSAGES = 'anthropic_messages'
+_ENDPOINT_ANTHROPIC_COUNT_TOKENS = 'anthropic_count_tokens'
+_ENDPOINT_OPENAI_CHAT_COMPLETIONS = 'openai_chat_completions'
+_ENDPOINT_OPENAI_RESPONSES = 'openai_responses'
+_ENDPOINT_HELLO = 'hello'
+
+
+def _normalize_path(req_path: str) -> str:
+    """Return a leading-slash path without a query string."""
+    return '/' + req_path.split('?', 1)[0].lstrip('/')
+
+
+def _classify_endpoint(method: str, req_path: str) -> Optional[str]:
+    """Classify the deliberately small HTTP surface exposed by the proxy."""
+    path = _normalize_path(req_path)
+    method = method.upper()
+
+    if method == 'HEAD' and path.endswith('/api/hello'):
+        return _ENDPOINT_HELLO
+    if method != 'POST':
+        return None
+    if path.endswith('/v1/messages/count_tokens'):
+        return _ENDPOINT_ANTHROPIC_COUNT_TOKENS
+    if path.endswith('/v1/messages'):
+        return _ENDPOINT_ANTHROPIC_MESSAGES
+    if path.endswith('/v1/chat/completions'):
+        return _ENDPOINT_OPENAI_CHAT_COMPLETIONS
+    if path.endswith('/v1/responses'):
+        return _ENDPOINT_OPENAI_RESPONSES
+    return None
+
+
+def _not_found_payload(method: str, req_path: str) -> dict[str, Any]:
+    path = _normalize_path(req_path)
+    message = f'{method.upper()} {path} is not supported by SessionClient.'
+    if path.endswith('/v1/messages') or path.endswith('/v1/messages/count_tokens'):
+        return {'type': 'error', 'error': {'type': 'not_found_error', 'message': message}}
+    return {'error': {'type': 'not_found_error', 'message': message}}
+
 
 # anthropic_beta flags to forward to the (possibly Bedrock-backed) upstream.
 # The Claude Code SDK injects flags Bedrock rejects (e.g. ``claude-code-*``,
@@ -360,6 +399,22 @@ class SessionClient:
 
     async def _handle_request(self, request: web.Request) -> web.Response:
         """Proxy handler: extract session, forward, record, return."""
+        req_path = request.match_info['path']
+        endpoint = _classify_endpoint(request.method, req_path)
+        if endpoint == _ENDPOINT_HELLO:
+            return web.Response(status=204)
+        if endpoint is None:
+            path = _normalize_path(req_path)
+            logger.warning('SessionClient rejected unsupported endpoint: method=%s path=%s', request.method, path)
+            return web.json_response(_not_found_payload(request.method, req_path), status=404)
+
+        is_anthropic = endpoint in {
+            _ENDPOINT_ANTHROPIC_MESSAGES,
+            _ENDPOINT_ANTHROPIC_COUNT_TOKENS,
+        }
+        is_responses = endpoint == _ENDPOINT_OPENAI_RESPONSES
+        is_generation = endpoint != _ENDPOINT_ANTHROPIC_COUNT_TOKENS
+
         # 1. Read request body
         request_body = await request.read()
         request_data = None
@@ -368,13 +423,8 @@ class SessionClient:
         except (json.JSONDecodeError, UnicodeDecodeError):
             pass
 
-        # Detect provider format by inspecting the requested endpoint
-        req_path = request.match_info['path']
-        is_anthropic = req_path.endswith('/messages') or '/v1/messages' in req_path
-        is_responses = req_path.endswith('/responses') or '/v1/responses' in req_path
-
         # 2. Inject session_id into request body
-        if isinstance(request_data, dict):
+        if is_generation and isinstance(request_data, dict):
             request_data.update(self.extra_body)
             request_data['session_id'] = self.session_id
             if is_anthropic:
@@ -406,19 +456,23 @@ class SessionClient:
         forward_headers.pop('Content-Length', None)
         forward_headers.pop('content-length', None)
 
-        if 'Authorization' in forward_headers:
-            forward_headers['Authorization'] = f'Bearer {self.real_api_key}'
-        if 'x-api-key' in forward_headers:
-            forward_headers['x-api-key'] = self.real_api_key
+        for header_name in list(forward_headers):
+            if header_name.lower() == 'authorization':
+                forward_headers[header_name] = f'Bearer {self.real_api_key}'
+            elif header_name.lower() == 'x-api-key':
+                forward_headers[header_name] = self.real_api_key
         if is_anthropic:
+            for header_name in [name for name in forward_headers if name.lower() == 'anthropic-version']:
+                forward_headers.pop(header_name)
             forward_headers['anthropic-version'] = '2023-06-01'
             # Mirror the body filter on the anthropic-beta header (comma-joined).
-            for k in [h for h in forward_headers if h.lower() == 'anthropic-beta']:
-                kept = [v.strip() for v in forward_headers[k].split(',') if v.strip() in _FORWARD_ANTHROPIC_BETAS]
-                if kept:
-                    forward_headers[k] = ','.join(kept)
-                else:
-                    forward_headers.pop(k, None)
+            if is_generation:
+                for k in [h for h in forward_headers if h.lower() == 'anthropic-beta']:
+                    kept = [v.strip() for v in forward_headers[k].split(',') if v.strip() in _FORWARD_ANTHROPIC_BETAS]
+                    if kept:
+                        forward_headers[k] = ','.join(kept)
+                    else:
+                        forward_headers.pop(k, None)
 
         # 5. Forward to real LLM
         # Build target URL, avoiding path duplication
@@ -434,7 +488,7 @@ class SessionClient:
         if request.query_string:
             target_url += f"?{request.query_string}"
 
-        is_stream = provider_request_data.get('stream', False) if provider_request_data else False
+        is_stream = bool(is_generation and provider_request_data and provider_request_data.get('stream', False))
 
         async with aiohttp.ClientSession() as client:
             async with client.request(
@@ -444,6 +498,7 @@ class SessionClient:
                 data=request_body,
                 proxy=self.http_proxy,
             ) as resp:
+                upstream_status = resp.status
                 if is_stream:
                     # Stream response: collect chunks, forward as-is.
                     # If the downstream client disconnects mid-stream (e.g. an
@@ -486,6 +541,11 @@ class SessionClient:
                         body=raw_response,
                     )
 
+        # Non-generation responses and upstream failures are transparent: do
+        # not parse, inspect, observe, or record their envelopes.
+        if not is_generation or upstream_status >= 400:
+            return response
+
         # 6. Parse response for recording
         response_data = None
         if is_stream:
@@ -500,7 +560,9 @@ class SessionClient:
             # Upstream returned an error body — forward it to the client
             # untouched (so the agent sees the real error), but treat
             # response as invalid so we don't record garbage.
-            if response_data and response_data.get('type') == 'error':
+            if not isinstance(response_data, dict):
+                response_data = None
+            elif response_data and response_data.get('type') == 'error':
                 logger.warning(f"Anthropic-format error from upstream: {response_data}")
                 response_data = None
             elif response_data and isinstance(response_data.get('error'), dict):
