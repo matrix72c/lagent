@@ -30,6 +30,23 @@ def _stable_json_digest(value: Any) -> str:
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
+def _normalize_tool_order(request: dict[str, Any]) -> int:
+    """Sort tool definitions as a set while retaining each definition verbatim."""
+    tools = request.get('tools')
+    if not isinstance(tools, list) or len(tools) < 2 or any(not isinstance(tool, dict) for tool in tools):
+        return 0
+
+    def sort_key(tool: dict[str, Any]) -> str:
+        tokenized = {key: value for key, value in tool.items() if key != 'cache_control'}
+        return json.dumps(tokenized, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+    normalized = sorted(tools, key=sort_key)
+    if normalized == tools:
+        return 0
+    request['tools'] = normalized
+    return 1
+
+
 def _strip_exact_system_paragraphs(text: str) -> tuple[str, int]:
     """Remove only complete, allowlisted reminder paragraphs from system text."""
     parts = re.split(r'(\n{2,})', text)
@@ -163,53 +180,82 @@ def _assistant_identity(content: Any) -> tuple[tuple[str, str], ...] | None:
             return None
         seen_ids.add(tool_id)
         identity.append((tool_id, name))
-    return tuple(identity) or None
+    # Tool definitions and parallel tool calls are sets for replay identity.
+    # The original response remains authoritative for the emitted token order.
+    return tuple(sorted(identity)) or None
 
 
 def _restore_replay_content(
     original: list[dict[str, Any]],
     replayed: list[dict[str, Any]],
 ) -> list[dict[str, Any]] | None:
-    """Restore token-bearing fields while retaining current cache metadata."""
-    if len(original) != len(replayed):
-        return None
+    """Restore an ID-anchored assistant response and retain cache metadata.
+
+    Claude Code may omit thinking/text blocks when it replays a tool-using
+    response. The ordered tool identities still uniquely anchor that replay to
+    the response returned by the model, so restore the original blocks instead
+    of requiring the lossy replay to have the same structure.
+    """
     if any(not isinstance(block, dict) for block in original + replayed):
         return None
+    supported_types = {'text', 'thinking', 'redacted_thinking', 'tool_use'}
     original_types = [block.get('type') for block in original]
-    if any(block_type not in {'text', 'thinking', 'tool_use'} for block_type in original_types):
+    replayed_types = [block.get('type') for block in replayed]
+    if any(block_type not in supported_types for block_type in original_types + replayed_types):
         return None
-    if original_types != [block.get('type') for block in replayed]:
+    original_identity = _assistant_identity(original)
+    if original_identity is None or original_identity != _assistant_identity(replayed):
         return None
 
-    restored = []
-    for original_block, replayed_block in zip(original, replayed):
-        if original_block.get('type') == 'tool_use' and (
-            original_block.get('id') != replayed_block.get('id')
-            or original_block.get('name') != replayed_block.get('name')
-        ):
-            return None
-        block = copy.deepcopy(original_block)
+    restored = copy.deepcopy(original)
+    for block in restored:
         block.pop('cache_control', None)
-        if 'cache_control' in replayed_block:
-            block['cache_control'] = copy.deepcopy(replayed_block['cache_control'])
-        restored.append(block)
+
+    original_tools = {
+        (block.get('id'), block.get('name')): index
+        for index, block in enumerate(original)
+        if block.get('type') == 'tool_use'
+    }
+    original_non_tools: dict[str, list[int]] = {}
+    for index, block in enumerate(original):
+        block_type = block.get('type')
+        if block_type != 'tool_use':
+            original_non_tools.setdefault(block_type, []).append(index)
+    non_tool_occurrences: dict[str, int] = {}
+    for replayed_block in replayed:
+        if 'cache_control' not in replayed_block:
+            continue
+        replayed_type = replayed_block.get('type')
+        if replayed_type == 'tool_use':
+            target_index = original_tools.get((replayed_block.get('id'), replayed_block.get('name')))
+        else:
+            original_type = 'thinking' if replayed_type == 'redacted_thinking' else replayed_type
+            occurrence = non_tool_occurrences.get(original_type, 0)
+            candidates = original_non_tools.get(original_type, [])
+            target_index = candidates[occurrence] if occurrence < len(candidates) else None
+            non_tool_occurrences[original_type] = occurrence + 1
+        if target_index is None:
+            return None
+        restored[target_index]['cache_control'] = copy.deepcopy(replayed_block['cache_control'])
     return restored
 
 
 class ClaudeCodePromptStabilizer(ProxyRequestProcessor):
     """Remove known prompt noise and restore identified assistant replays."""
 
-    VERSION = 'claude-code-prompt-v3'
+    VERSION = 'claude-code-prompt-v4'
 
     def __init__(
         self,
         drop_task_tools_reminder: bool = True,
         restore_tool_use_replays: bool = True,
         normalize_inline_system_messages: bool = True,
+        normalize_tool_order: bool = True,
     ):
         self.drop_task_tools_reminder = drop_task_tools_reminder
         self.restore_tool_use_replays = restore_tool_use_replays
         self.normalize_inline_system_messages = normalize_inline_system_messages
+        self.normalize_tool_order = normalize_tool_order
         self.reset()
 
     def reset(self) -> None:
@@ -226,6 +272,7 @@ class ClaudeCodePromptStabilizer(ProxyRequestProcessor):
             'assistant_replays_ambiguous': 0,
             'bootstrap_system_messages_rewritten': 0,
             'dynamic_system_messages_rewritten': 0,
+            'tool_orders_normalized': 0,
             'system_changed': 0,
             'tools_changed': 0,
             'model_changed': 0,
@@ -240,6 +287,8 @@ class ClaudeCodePromptStabilizer(ProxyRequestProcessor):
             return request
 
         self._stats['requests_seen'] += 1
+        if self.normalize_tool_order:
+            self._stats['tool_orders_normalized'] += _normalize_tool_order(request)
         if self.drop_task_tools_reminder:
             self._stats['reminders_removed'] += self._remove_known_reminders(request)
         if self.normalize_inline_system_messages:

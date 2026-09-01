@@ -174,6 +174,20 @@ def test_late_system_change_is_rewritten_in_place_without_changing_prompt_head()
     assert stats['system_changed'] == 0
 
 
+def test_tool_definition_permutations_share_one_stable_order_and_head():
+    tool_a = {'name': 'A', 'input_schema': {'type': 'object'}, 'cache_control': {'type': 'ephemeral'}}
+    tool_b = {'name': 'B', 'input_schema': {'type': 'object'}}
+    stabilizer = ClaudeCodePromptStabilizer()
+
+    first = stabilizer.before_forward(_request(tools=[tool_b, tool_a]), _context())
+    second = stabilizer.before_forward(_request(tools=[tool_a, tool_b]), _context(1))
+
+    assert first['tools'] == second['tools'] == [tool_a, tool_b]
+    stats = stabilizer.get_stats()
+    assert stats['tool_orders_normalized'] == 1
+    assert stats['tools_changed'] == 0
+
+
 def test_reminder_is_removed_from_all_system_shapes_and_wrapped_user_blocks():
     wrapped = f'<system-reminder>\n{TASK_TOOLS_REMINDER}\n</system-reminder>'
     request = _request(
@@ -238,7 +252,62 @@ def test_tool_use_replay_restores_original_tokens_and_current_cache_control():
     assert stabilizer.get_stats()['assistant_replays_restored'] == 1
 
 
-def test_plain_text_and_changed_tool_shape_are_not_restored():
+def test_tool_use_replay_restores_blocks_omitted_by_claude_history():
+    stabilizer = ClaudeCodePromptStabilizer()
+    response = _tool_response()
+    response['content'] = [
+        {'type': 'thinking', 'thinking': 'inspect carefully', 'signature': 'signed'},
+        {'type': 'text', 'text': 'I will inspect it.\n\n'},
+        {'type': 'tool_use', 'id': 'toolu_1', 'name': 'Bash', 'input': {'timeout': '60000'}},
+    ]
+    stabilizer.after_response(_request(), response, _context())
+    replay = [
+        {
+            'type': 'tool_use',
+            'id': 'toolu_1',
+            'name': 'Bash',
+            'input': {'timeout': 60000},
+            'cache_control': {'type': 'ephemeral'},
+        },
+    ]
+
+    processed = stabilizer.before_forward(
+        _request(messages=[{'role': 'assistant', 'content': replay}]),
+        _context(1),
+    )
+
+    assert processed['messages'][0]['content'] == [
+        {'type': 'thinking', 'thinking': 'inspect carefully', 'signature': 'signed'},
+        {'type': 'text', 'text': 'I will inspect it.\n\n'},
+        {
+            'type': 'tool_use',
+            'id': 'toolu_1',
+            'name': 'Bash',
+            'input': {'timeout': '60000'},
+            'cache_control': {'type': 'ephemeral'},
+        },
+    ]
+    assert stabilizer.get_stats()['assistant_replays_restored'] == 1
+
+
+def test_tool_use_replay_with_unmappable_mid_response_cache_boundary_is_unchanged():
+    stabilizer = ClaudeCodePromptStabilizer()
+    stabilizer.after_response(_request(), _tool_response(), _context())
+    replay = [
+        {'type': 'thinking', 'thinking': 'rewritten', 'cache_control': {'type': 'ephemeral'}},
+        {'type': 'tool_use', 'id': 'toolu_1', 'name': 'Bash', 'input': {'timeout': 1}},
+    ]
+
+    processed = stabilizer.before_forward(
+        _request(messages=[{'role': 'assistant', 'content': copy.deepcopy(replay)}]),
+        _context(1),
+    )
+
+    assert processed['messages'][0]['content'] == replay
+    assert stabilizer.get_stats()['assistant_replays_ambiguous'] == 1
+
+
+def test_plain_text_and_reordered_tool_replay_use_original_response_order():
     stabilizer = ClaudeCodePromptStabilizer()
     stabilizer.after_response(_request(), _tool_response(), _context())
     messages = [
@@ -254,11 +323,30 @@ def test_plain_text_and_changed_tool_shape_are_not_restored():
 
     processed = stabilizer.before_forward(_request(messages=copy.deepcopy(messages)), _context(1))
 
-    assert processed['messages'] == messages
+    assert processed['messages'][0] == messages[0]
+    assert processed['messages'][1]['content'] == _tool_response()['content']
     stats = stabilizer.get_stats()
-    assert stats['assistant_replays_restored'] == 0
+    assert stats['assistant_replays_restored'] == 1
     assert stats['assistant_replays_unanchored'] == 1
-    assert stats['assistant_replays_ambiguous'] == 1
+    assert stats['assistant_replays_ambiguous'] == 0
+
+
+def test_parallel_tool_replay_order_is_restored_by_unique_id_set():
+    stabilizer = ClaudeCodePromptStabilizer()
+    response = _tool_response()
+    response['content'].append(
+        {'type': 'tool_use', 'id': 'toolu_2', 'name': 'Read', 'input': {'path': '/tmp/a'}},
+    )
+    stabilizer.after_response(_request(), response, _context())
+    replay = [copy.deepcopy(response['content'][2]), copy.deepcopy(response['content'][1])]
+
+    processed = stabilizer.before_forward(
+        _request(messages=[{'role': 'assistant', 'content': replay}]),
+        _context(1),
+    )
+
+    assert processed['messages'][0]['content'] == response['content']
+    assert stabilizer.get_stats()['assistant_replays_restored'] == 1
 
 
 def test_reused_tool_id_with_different_name_is_ambiguous():
