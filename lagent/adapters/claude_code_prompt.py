@@ -192,9 +192,9 @@ def _restore_replay_content(
     """Restore an ID-anchored assistant response and retain cache metadata.
 
     Claude Code may omit thinking/text blocks when it replays a tool-using
-    response. The ordered tool identities still uniquely anchor that replay to
-    the response returned by the model, so restore the original blocks instead
-    of requiring the lossy replay to have the same structure.
+    response. The unique tool identity set still anchors that replay to the
+    response returned by the model, so restore the original blocks and order
+    instead of requiring the lossy replay to have the same structure or order.
     """
     if any(not isinstance(block, dict) for block in original + replayed):
         return None
