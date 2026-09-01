@@ -60,6 +60,19 @@ def test_strip_exact_system_paragraphs_removes_only_complete_matches():
     assert _strip_exact_system_paragraphs(f'base\n\n{TASK_TOOLS_REMINDER}\n') == ('base', 1)
 
 
+def test_strip_exact_system_paragraphs_removes_accumulated_real_rollout_shape():
+    text = (
+        f'base\n\n{TASK_TOOLS_REMINDER}'
+        f'\n\n\n{TASK_TOOLS_REMINDER}'
+        f'\n\n\n{TASK_TOOLS_REMINDER}\n'
+    )
+
+    assert _strip_exact_system_paragraphs(text) == ('base', 3)
+    assert _strip_exact_system_paragraphs(
+        f'before\n\n{TASK_TOOLS_REMINDER}\n\n\nafter'
+    ) == ('before\n\nafter', 1)
+
+
 def test_real_trailing_newline_reminder_is_removed_only_from_system_role():
     reminder = f'{TASK_TOOLS_REMINDER}\n'
     request = _request(

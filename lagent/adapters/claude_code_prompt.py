@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import re
 from typing import Any
 
 from .request_processor import ProxyRequestContext, ProxyRequestProcessor
@@ -31,15 +32,28 @@ def _stable_json_digest(value: Any) -> str:
 
 def _strip_exact_system_paragraphs(text: str) -> tuple[str, int]:
     """Remove only complete, allowlisted reminder paragraphs from system text."""
-    parts = text.split('\n\n')
-    kept = []
-    removed = 0
-    for part in parts:
-        if part in _SYSTEM_TASK_TOOLS_REMINDERS:
-            removed += 1
-        else:
-            kept.append(part)
-    return '\n\n'.join(kept), removed
+    parts = re.split(r'(\n{2,})', text)
+    paragraphs = parts[::2]
+    separators = parts[1::2]
+    kept_indices = [
+        index for index, paragraph in enumerate(paragraphs) if paragraph not in _SYSTEM_TASK_TOOLS_REMINDERS
+    ]
+    removed = len(paragraphs) - len(kept_indices)
+    if not removed:
+        return text, 0
+    if not kept_indices:
+        return '', removed
+
+    output = [paragraphs[kept_indices[0]]]
+    previous = kept_indices[0]
+    for index in kept_indices[1:]:
+        # When exact reminder paragraphs disappear from the middle, retain the
+        # first original paragraph separator. This preserves neighboring text
+        # while preventing Claude Code's repeated "\n\n\n" reminder joins from
+        # accumulating blank lines on every request.
+        output.extend((separators[previous], paragraphs[index]))
+        previous = index
+    return ''.join(output), removed
 
 
 def _strip_system_content(content: Any) -> tuple[Any, int]:
