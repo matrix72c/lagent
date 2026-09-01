@@ -115,72 +115,35 @@ def _strip_wrapped_content(content: Any) -> tuple[Any, int]:
     return output, removed
 
 
-def _merge_system_content(parts: list[Any]) -> Any:
-    """Merge Anthropic system content without changing text bytes or block metadata."""
-    if all(isinstance(part, str) for part in parts):
-        return ''.join(parts)
+def _rewrite_inline_system_messages(request: dict[str, Any]) -> tuple[int, int]:
+    """Represent inline system turns in place using a supported chat role.
 
-    blocks: list[dict[str, Any]] = []
-    for part in parts:
-        if isinstance(part, str):
-            blocks.append({'type': 'text', 'text': part})
-            continue
-        if not isinstance(part, list):
-            raise TypeError(f'Unsupported Anthropic system content: {type(part).__name__}')
-        for block in part:
-            if not (
-                isinstance(block, dict)
-                and block.get('type') == 'text'
-                and isinstance(block.get('text'), str)
-            ):
-                raise TypeError('Anthropic system content may contain only text blocks')
-            blocks.append(copy.deepcopy(block))
-    return blocks
-
-
-def _lift_inline_system_messages(request: dict[str, Any]) -> tuple[int, int]:
-    """Lift genuine inline system turns while retaining their original order.
-
-    Claude Code emits an initial, invariant system fragment after a generated
-    user-side environment reminder. Qwen templates reject that wire shape even
-    though it is still part of the initial header. Later system turns represent
-    actual instruction changes and therefore intentionally create a new prompt
-    root after being lifted.
+    Claude Code sends system turns inside ``messages`` while Qwen accepts the
+    system role only at the beginning. Moving a newly observed system turn to
+    the beginning would rewrite the already cached history. Re-labeling it as
+    a user turn preserves its content, metadata, chronological position, and
+    the strict prefix shared with the preceding request.
     """
     messages = request.get('messages')
     if not isinstance(messages, list):
         return 0, 0
 
-    kept_messages = []
-    inline_parts = []
     bootstrap = 0
     dynamic = 0
     saw_assistant = False
     for message in messages:
         if not isinstance(message, dict):
-            kept_messages.append(message)
             continue
         role = message.get('role')
         if role == 'assistant':
             saw_assistant = True
         if role != 'system':
-            kept_messages.append(message)
             continue
-        inline_parts.append(message.get('content', ''))
         if saw_assistant:
             dynamic += 1
         else:
             bootstrap += 1
-
-    if not inline_parts:
-        return 0, 0
-
-    system_parts = []
-    if 'system' in request:
-        system_parts.append(request['system'])
-    system_parts.extend(inline_parts)
-    request['system'] = _merge_system_content(system_parts)
-    request['messages'] = kept_messages
+        message['role'] = 'user'
     return bootstrap, dynamic
 
 
@@ -236,7 +199,7 @@ def _restore_replay_content(
 class ClaudeCodePromptStabilizer(ProxyRequestProcessor):
     """Remove known prompt noise and restore identified assistant replays."""
 
-    VERSION = 'claude-code-prompt-v2'
+    VERSION = 'claude-code-prompt-v3'
 
     def __init__(
         self,
@@ -261,8 +224,8 @@ class ClaudeCodePromptStabilizer(ProxyRequestProcessor):
             'assistant_replays_restored': 0,
             'assistant_replays_unanchored': 0,
             'assistant_replays_ambiguous': 0,
-            'bootstrap_system_messages_lifted': 0,
-            'dynamic_system_messages_lifted': 0,
+            'bootstrap_system_messages_rewritten': 0,
+            'dynamic_system_messages_rewritten': 0,
             'system_changed': 0,
             'tools_changed': 0,
             'model_changed': 0,
@@ -280,9 +243,9 @@ class ClaudeCodePromptStabilizer(ProxyRequestProcessor):
         if self.drop_task_tools_reminder:
             self._stats['reminders_removed'] += self._remove_known_reminders(request)
         if self.normalize_inline_system_messages:
-            bootstrap, dynamic = _lift_inline_system_messages(request)
-            self._stats['bootstrap_system_messages_lifted'] += bootstrap
-            self._stats['dynamic_system_messages_lifted'] += dynamic
+            bootstrap, dynamic = _rewrite_inline_system_messages(request)
+            self._stats['bootstrap_system_messages_rewritten'] += bootstrap
+            self._stats['dynamic_system_messages_rewritten'] += dynamic
         if self.restore_tool_use_replays:
             self._stats['assistant_replays_restored'] += self._restore_assistant_replays(request['messages'])
         self._record_head_changes(request)

@@ -89,7 +89,7 @@ def test_real_trailing_newline_reminder_is_removed_only_from_system_role():
     assert stabilizer.get_stats()['reminders_removed'] == 1
 
 
-def test_real_claude_sequence_lifts_stable_bootstrap_and_drops_late_reminder():
+def test_real_claude_sequence_rewrites_stable_bootstrap_in_place_and_drops_late_reminder():
     bootstrap = [
         {'type': 'text', 'text': 'stable project instructions', 'cache_control': {'type': 'ephemeral'}},
     ]
@@ -104,18 +104,19 @@ def test_real_claude_sequence_lifts_stable_bootstrap_and_drops_late_reminder():
 
     processed = stabilizer.before_forward(_request(messages=messages), _context())
 
-    assert processed['system'] == [
-        {'type': 'text', 'text': 'base system'},
-        {'type': 'text', 'text': 'stable project instructions', 'cache_control': {'type': 'ephemeral'}},
+    assert processed['system'] == 'base system'
+    assert processed['messages'] == [
+        messages[0],
+        {'role': 'user', 'content': bootstrap},
+        *messages[2:4],
     ]
-    assert processed['messages'] == messages[:1] + messages[2:4]
     stats = stabilizer.get_stats()
     assert stats['reminders_removed'] == 1
-    assert stats['bootstrap_system_messages_lifted'] == 1
-    assert stats['dynamic_system_messages_lifted'] == 0
+    assert stats['bootstrap_system_messages_rewritten'] == 1
+    assert stats['dynamic_system_messages_rewritten'] == 0
 
 
-def test_stable_bootstrap_lift_preserves_strict_prefix_across_requests():
+def test_stable_bootstrap_rewrite_preserves_strict_prefix_across_requests():
     bootstrap = 'stable bootstrap'
     first_messages = [
         {'role': 'user', 'content': '<system-reminder>environment</system-reminder>'},
@@ -131,12 +132,13 @@ def test_stable_bootstrap_lift_preserves_strict_prefix_across_requests():
     first = stabilizer.before_forward(_request(messages=copy.deepcopy(first_messages)), _context())
     second = stabilizer.before_forward(_request(messages=copy.deepcopy(second_messages)), _context(1))
 
-    assert first['system'] == second['system'] == f'base system{bootstrap}'
+    assert first['system'] == second['system'] == 'base system'
+    assert first['messages'][1] == {'role': 'user', 'content': bootstrap}
     assert second['messages'][: len(first['messages'])] == first['messages']
     assert stabilizer.get_stats()['system_changed'] == 0
 
 
-def test_real_system_change_is_lifted_and_counted_as_required_new_root():
+def test_late_system_change_is_rewritten_in_place_without_changing_prompt_head():
     stabilizer = ClaudeCodePromptStabilizer()
     first = stabilizer.before_forward(
         _request(
@@ -162,13 +164,14 @@ def test_real_system_change_is_lifted_and_counted_as_required_new_root():
         _context(1),
     )
 
-    assert first['system'] == 'base systemstable bootstrap'
-    assert second['system'] == 'base systemstable bootstrapnew global instruction'
+    assert first['system'] == second['system'] == 'base system'
     assert all(message['role'] != 'system' for message in first['messages'] + second['messages'])
+    assert second['messages'][: len(first['messages'])] == first['messages']
+    assert second['messages'][-1] == {'role': 'user', 'content': 'new global instruction'}
     stats = stabilizer.get_stats()
-    assert stats['bootstrap_system_messages_lifted'] == 2
-    assert stats['dynamic_system_messages_lifted'] == 1
-    assert stats['system_changed'] == 1
+    assert stats['bootstrap_system_messages_rewritten'] == 2
+    assert stats['dynamic_system_messages_rewritten'] == 1
+    assert stats['system_changed'] == 0
 
 
 def test_reminder_is_removed_from_all_system_shapes_and_wrapped_user_blocks():
@@ -190,11 +193,11 @@ def test_reminder_is_removed_from_all_system_shapes_and_wrapped_user_blocks():
     processed = stabilizer.before_forward(request, _context())
 
     assert processed['messages'] == [
+        {'role': 'user', 'content': 'project'},
         {'role': 'user', 'content': TASK_TOOLS_REMINDER},
     ]
     assert processed['system'] == [
         {'type': 'text', 'text': 'base', 'cache_control': {'type': 'ephemeral'}},
-        {'type': 'text', 'text': 'project'},
     ]
     assert stabilizer.get_stats()['reminders_removed'] == 3
 
