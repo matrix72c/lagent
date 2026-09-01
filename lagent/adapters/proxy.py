@@ -487,8 +487,6 @@ class SessionClient:
         is_anthropic = req_path.endswith('/messages') or '/v1/messages' in req_path
         is_responses = req_path.endswith('/responses') or '/v1/responses' in req_path
 
-        request_context = None
-
         # 2. Inject session_id into request body
         if isinstance(request_data, dict):
             request_data.update(self.extra_body)
@@ -650,7 +648,7 @@ class SessionClient:
         if not response_data:
             return response
 
-        if request_context is not None and isinstance(request_data, dict):
+        if isinstance(request_data, dict) and ('messages' in request_data or 'input' in request_data):
             self._observe_request_processor_response(request_data, response_data, request_context)
 
         # 7. Record
