@@ -57,6 +57,23 @@ def test_strip_exact_system_paragraphs_removes_only_complete_matches():
         f'quoted: {TASK_TOOLS_REMINDER}',
         0,
     )
+    assert _strip_exact_system_paragraphs(f'base\n\n{TASK_TOOLS_REMINDER}\n') == ('base', 1)
+
+
+def test_real_trailing_newline_reminder_is_removed_only_from_system_role():
+    reminder = f'{TASK_TOOLS_REMINDER}\n'
+    request = _request(
+        messages=[
+            {'role': 'system', 'content': reminder},
+            {'role': 'user', 'content': reminder},
+        ]
+    )
+    stabilizer = ClaudeCodePromptStabilizer()
+
+    processed = stabilizer.before_forward(request, _context())
+
+    assert processed['messages'] == [{'role': 'user', 'content': reminder}]
+    assert stabilizer.get_stats()['reminders_removed'] == 1
 
 
 def test_reminder_is_removed_from_all_system_shapes_and_wrapped_user_blocks():

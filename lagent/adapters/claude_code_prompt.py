@@ -4,8 +4,8 @@ import copy
 import hashlib
 import json
 from typing import Any
-from .request_processor import ProxyRequestContext, ProxyRequestProcessor
 
+from .request_processor import ProxyRequestContext, ProxyRequestProcessor
 
 TASK_TOOLS_REMINDER = (
     "The task tools haven't been used recently. If you're working on tasks that would benefit from tracking "
@@ -16,6 +16,11 @@ TASK_TOOLS_REMINDER = (
 _WRAPPED_TASK_TOOLS_REMINDERS = {
     f'<system-reminder>{TASK_TOOLS_REMINDER}</system-reminder>',
     f'<system-reminder>\n{TASK_TOOLS_REMINDER}\n</system-reminder>',
+}
+_SYSTEM_TASK_TOOLS_REMINDERS = {
+    TASK_TOOLS_REMINDER,
+    f'{TASK_TOOLS_REMINDER}\n',
+    *_WRAPPED_TASK_TOOLS_REMINDERS,
 }
 
 
@@ -30,7 +35,7 @@ def _strip_exact_system_paragraphs(text: str) -> tuple[str, int]:
     kept = []
     removed = 0
     for part in parts:
-        if part == TASK_TOOLS_REMINDER or part in _WRAPPED_TASK_TOOLS_REMINDERS:
+        if part in _SYSTEM_TASK_TOOLS_REMINDERS:
             removed += 1
         else:
             kept.append(part)
