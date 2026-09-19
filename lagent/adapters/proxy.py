@@ -436,7 +436,12 @@ class SessionClient:
 
         is_stream = provider_request_data.get('stream', False) if provider_request_data else False
 
-        async with aiohttp.ClientSession() as client:
+        # Long agentic generations (large prefill under queueing plus minutes
+        # of decode) exceed aiohttp's default 300s total timeout, which the
+        # upstream agent surfaces as a spurious 504. Bound only the connect
+        # phase and let an active stream run as long as it produces bytes.
+        forward_timeout = aiohttp.ClientTimeout(total=None, connect=30.0, sock_connect=30.0, sock_read=1800.0)
+        async with aiohttp.ClientSession(timeout=forward_timeout) as client:
             async with client.request(
                 method=request.method,
                 url=target_url,
