@@ -1154,10 +1154,11 @@ class SessionClient:
                 if current_block:
                     # Parse partial_json into input for tool_use blocks
                     if 'partial_json' in current_block:
+                        partial_json = current_block.pop('partial_json')
                         try:
-                            current_block['input'] = json.loads(current_block.pop('partial_json'))
+                            current_block['input'] = json.loads(partial_json)
                         except json.JSONDecodeError:
-                            current_block['input'] = current_block.pop('partial_json')
+                            current_block['input'] = partial_json
                     content_blocks.append(current_block)
                     current_block = {}
 
