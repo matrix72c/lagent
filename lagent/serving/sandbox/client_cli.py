@@ -6,6 +6,7 @@ so an outer runner can record each phase as an explicit entry.
 """
 
 from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -120,6 +121,9 @@ def cmd_wait_ready(args: argparse.Namespace) -> int:
 
 def cmd_start_agent_daemon(args: argparse.Namespace) -> int:
     try:
+        pid = _read_pid(args.pid_file)
+        if pid is not None and _pid_alive(pid):
+            raise RuntimeError(f'daemon pid {pid} is already running')
         for path in (args.sock, args.pid_file):
             if path and os.path.exists(path):
                 os.unlink(path)
@@ -139,6 +143,8 @@ def cmd_start_agent_daemon(args: argparse.Namespace) -> int:
             "--sock",
             args.sock,
         ]
+        if getattr(args, 'template', None):
+            cmd.extend(['--template', args.template])
         proc = subprocess.Popen(
             cmd,
             stdout=log_file,
@@ -228,6 +234,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("start-agent-daemon", help="Start an AgentDaemon in the background")
     p.add_argument("--mode", choices=["agent"], default="agent")
     p.add_argument("--config", required=True)
+    from .templates import TEMPLATES
+    p.add_argument('--template', choices=TEMPLATES, help='Select a built-in template; --config is runtime JSON')
     p.add_argument("--sock", default="/tmp/lagent_agent.sock")
     p.add_argument("--pid-file", required=True)
     p.add_argument("--log", required=True)

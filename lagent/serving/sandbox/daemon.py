@@ -28,6 +28,7 @@ Usage::
 """
 
 from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -406,7 +407,13 @@ async def async_lagent_call(sock_path: str, request_json: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _load_config(config_path: str, mode: str) -> list[dict] | dict:
+def _load_config(config_path: str, mode: str, template: str | None = None) -> list[dict] | dict:
+    if template is not None:
+        if mode != 'agent' or config_path.endswith('.py'):
+            raise ValueError('Templates require agent mode and a JSON runtime config')
+        from .templates import build_config
+        with open(config_path) as f:
+            return build_config(template, json.load(f))
     if config_path.endswith('.py'):
         cfg = Config.fromfile(config_path)
         expected = 'agent_config' if mode == 'agent' else 'actions'
@@ -442,6 +449,8 @@ def main():
         help='Path to config: JSON (action list / agent dict) or Python file '
         "defining 'actions' (mode=actions) or 'agent_config' (mode=agent)",
     )
+    from .templates import TEMPLATES
+    p_start.add_argument('--template', choices=TEMPLATES, help='Build a versioned template from JSON runtime config')
     # Backward compat
     p_start.add_argument('--actions-config', help=argparse.SUPPRESS)
     p_start.add_argument('--agent-config', help=argparse.SUPPRESS)
@@ -469,7 +478,7 @@ def main():
         if not config_path:
             parser.error('Must provide --config (or --actions-config / --agent-config)')
 
-        config = _load_config(config_path, mode)
+        config = _load_config(config_path, mode, args.template)
 
         if mode == 'agent':
             daemon = AgentDaemon(agent=config, sock_path=args.sock)
