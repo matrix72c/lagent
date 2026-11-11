@@ -66,7 +66,7 @@ def test_nested_options_and_unlimited_turns(runtime, monkeypatch):
     assert config["extra_options"]["cli_path"].startswith("/runtime/node/")
     assert (
         build_config("opencode", {**runtime, "options": {}})["binary"]
-        == "/runtime/node/node-v22.14.0/bin/opencode"
+        == "/runtime/node/bin/opencode"
     )
 
 

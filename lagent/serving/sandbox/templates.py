@@ -193,7 +193,7 @@ def build_config(template: str, runtime: dict) -> dict:
         }
     root = runtime.get("root")
     if root:
-        node = Path(root) / "node/node-v22.14.0"
+        node = Path(root) / "node"
         if template == "claude_code":
             config["extra_options"]["cli_path"] = str(
                 node / "lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
