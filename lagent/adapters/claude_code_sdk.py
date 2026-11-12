@@ -198,28 +198,27 @@ class ClaudeCodeSDKAdapter(AsyncExternalAgent):
                     record['data'] = message.data
 
                 messages.append(record)
-        except Exception as exc:
-            # SDK may error after yielding some messages.
-            # Log but don't lose what we already captured.
-            import logging
+        finally:
+            # Preserve diagnostics even when the SDK raises or the call is cancelled.
+            # Exceptions must reach AsyncExternalAgent.forward's error envelope.
+            self._sdk_trace.extend(messages)
 
-            logging.getLogger(__name__).warning(f"SDK query error (captured {len(messages)} events): {exc}")
+            # Capture session_id for multi-turn
+            if result_msg and result_msg.session_id:
+                self._session_id = result_msg.session_id
 
-        self._sdk_trace.extend(messages)
+            # Fallback: try to get session_id from trace events
+            if not self._session_id:
+                for evt in reversed(messages):
+                    sid = evt.get('session_id')
+                    if sid:
+                        self._session_id = sid
+                        break
 
-        # Capture session_id for multi-turn
-        if result_msg and result_msg.session_id:
-            self._session_id = result_msg.session_id
+            self._call_count += 1
 
-        # Fallback: try to get session_id from trace events
-        if not self._session_id:
-            for evt in reversed(messages):
-                sid = evt.get('session_id')
-                if sid:
-                    self._session_id = sid
-                    break
-
-        self._call_count += 1
+        if result_msg and result_msg.is_error:
+            raise RuntimeError('Claude Code SDK reported an error result; see SDK trace for details')
 
         # Return the final result
         if result_msg and result_msg.result:
